@@ -419,12 +419,44 @@ export async function fetchInitialProperties(limit = 9): Promise<Property[]> {
   return posts.map(p => mapWPPostToProperty(p, true));
 }
 
+/** Typed error for WordPress REST API upstream failures */
+export class WordPressApiError extends Error {
+  public readonly status: number;
+  public readonly endpoint: string;
+  public readonly isRetryable: boolean;
+
+  constructor(status: number, endpoint: string, message?: string) {
+    super(message || `WordPress API error: HTTP ${status} for ${endpoint}`);
+    this.name = 'WordPressApiError';
+    this.status = status;
+    this.endpoint = endpoint;
+    this.isRetryable = status === 429 || (status >= 500 && status <= 599);
+    Object.setPrototypeOf(this, WordPressApiError.prototype);
+  }
+}
+
 /** Fetch single property by ID — uses dedicated endpoint */
 export async function fetchPropertyById(id: number): Promise<Property | null> {
-  const postRes = await fetch(`${WP_API_BASE}/anunturi/${id}`);
-  if (!postRes.ok) return null;
+  const url = `${WP_API_BASE}/anunturi/${id}`;
+  const postRes = await fetch(url);
 
+  // ONLY an explicit HTTP 404 means the property does not exist
+  if (postRes.status === 404) {
+    return null;
+  }
+
+  // All other non-2xx statuses (429, 500, 503, etc.) are upstream failures and must throw
+  if (!postRes.ok) {
+    throw new WordPressApiError(
+      postRes.status,
+      'property',
+      `Failed to fetch property ${id}: HTTP ${postRes.status}`
+    );
+  }
+
+  // If body is malformed JSON, .json() throws naturally and propagates
   const post: WPPost = await postRes.json();
   return mapWPPostToProperty(post);
 }
+
 

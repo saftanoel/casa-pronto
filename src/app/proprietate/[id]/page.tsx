@@ -6,12 +6,28 @@ type Props = {
   params: Promise<{ id: string }>
 }
 
+function parsePropertyId(rawId: string): number | null {
+  if (!rawId || !/^\d+$/.test(rawId)) {
+    return null;
+  }
+  const id = Number(rawId);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return null;
+  }
+  return id;
+}
+
 export async function generateMetadata(
   { params }: Props,
   parent: ResolvingMetadata
 ): Promise<Metadata> {
   const resolvedParams = await params;
-  const property = await fetchPropertyById(Number(resolvedParams.id));
+  const propertyId = parsePropertyId(resolvedParams.id);
+  if (propertyId === null) {
+    notFound();
+  }
+
+  const property = await fetchPropertyById(propertyId);
 
   if (!property) {
     return {
@@ -40,7 +56,12 @@ export async function generateMetadata(
 
 export default async function PropertyPage({ params }: Props) {
   const resolvedParams = await params;
-  const property = await fetchPropertyById(Number(resolvedParams.id));
+  const propertyId = parsePropertyId(resolvedParams.id);
+  if (propertyId === null) {
+    notFound();
+  }
+
+  const property = await fetchPropertyById(propertyId);
 
   if (!property) {
     notFound();
