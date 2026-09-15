@@ -61,22 +61,6 @@ The initial version (V1) was built as a Vite-based React Single Page Application
 * **Taxonomies & Meta:** Dynamic taxonomy mapping for property types (`tip`), statuses (`tab`), locations (`zone`), surface areas, and room counts.
 * **Media Optimization:** Direct integration with WordPress media library arrays.
 
-## 🛠️ Development & Deployment
 
-```bash
-# Install dependencies
-npm install
-
-# Run local development server
-npm run dev
-
-# Production build
-npm run build
-
-# Start production server
-npm run start
-```
-
----
 
 *🤖 **AI-Assisted & Human-Engineered Workflow:*** *This project represents a powerful hybrid approach—combining advanced AI tools with hardcore manual engineering. While initially bootstrapped with **Lovable** for rapid UI prototyping, and leveraging **Antigravity IDE** to build complex React logic, the core integration relied heavily on manual coding and human oversight. Server configurations, custom Next.js App Router integrations, and performance optimizations were meticulously hand-coded and fine-tuned by the developer. The result is a carefully handcrafted, production-grade application capable of handling 4,700+ properties with uncompromising speed and SEO compliance.*
