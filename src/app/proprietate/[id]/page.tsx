@@ -1,6 +1,7 @@
 import { Metadata, ResolvingMetadata } from 'next';
 import { notFound } from 'next/navigation';
 import { fetchPropertyById } from '@/lib/api/wordpress';
+import { SITE_URL } from '@/lib/constants';
 
 type Props = {
   params: Promise<{ id: string }>
@@ -46,7 +47,7 @@ export async function generateMetadata(
       images: seo.og_image ? [{ url: seo.og_image }] : undefined,
     },
     alternates: {
-      canonical: seo.canonical_url,
+      canonical: `${SITE_URL}/proprietate/${propertyId}`,
     },
     robots: {
       index: !seo.noindex,

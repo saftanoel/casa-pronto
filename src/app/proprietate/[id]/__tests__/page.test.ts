@@ -49,7 +49,7 @@ describe('Property detail route - SEO false-404 regression tests', () => {
     vi.clearAllMocks();
   });
 
-  it('VALID PROPERTY: generateMetadata returns property metadata and PropertyPage renders', async () => {
+  it('VALID PROPERTY: generateMetadata returns property metadata with authoritative canonical and PropertyPage renders', async () => {
     vi.spyOn(wpApi, 'fetchPropertyById').mockResolvedValue(mockProperty);
 
     const metadata = await generateMetadata(
@@ -58,10 +58,35 @@ describe('Property detail route - SEO false-404 regression tests', () => {
     );
     expect(metadata.title).toBe('Vila Moderna de Vanzare Alba Iulia');
     expect(metadata.description).toBe('Vila de lux in Cetate');
+    expect(metadata.openGraph?.title).toBe('Vila Moderna de Vanzare Alba Iulia');
+    expect(metadata.openGraph?.description).toBe('Vila de lux in Cetate');
+    expect(metadata.openGraph?.images).toEqual([{ url: 'https://casapronto.ro/vila.jpg' }]);
+    expect(metadata.robots).toEqual({ index: true });
+    // Authoritative canonical URL check
+    expect(metadata.alternates?.canonical).toBe('https://www.casapronto.ro/proprietate/1234');
 
     const jsx = await PropertyPage({ params: Promise.resolve({ id: '1234' }) });
     expect(jsx).toBeDefined();
     expect(nextNavigation.notFound).not.toHaveBeenCalled();
+  });
+
+  it('LEGACY CANONICAL OVERRIDE: WordPress returns legacy permalink, Next.js still outputs authoritative route canonical', async () => {
+    const propertyWithLegacyCanonical: Property = {
+      ...mockProperty,
+      seo: {
+        ...mockProperty.seo,
+        canonical_url: 'https://casapronto.ro/anunturi-imobiliare/vila-moderna-cetate-alba-iulia',
+      },
+    };
+    vi.spyOn(wpApi, 'fetchPropertyById').mockResolvedValue(propertyWithLegacyCanonical);
+
+    const metadata = await generateMetadata(
+      { params: Promise.resolve({ id: '1234' }) },
+      mockResolvingMetadata
+    );
+
+    expect(metadata.alternates?.canonical).toBe('https://www.casapronto.ro/proprietate/1234');
+    expect(metadata.alternates?.canonical).not.toBe(propertyWithLegacyCanonical.seo?.canonical_url);
   });
 
   it('GENUINELY MISSING PROPERTY (WordPress 404): PropertyPage triggers notFound() and generateMetadata returns not found title', async () => {
