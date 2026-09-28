@@ -2,9 +2,11 @@ import type { Metadata } from "next";
 import QueryProvider from "@/providers/QueryProvider";
 import Header from "@/components/Header";
 import Footer from "@/components/Footer";
+import { SITE_URL } from "@/lib/constants";
 import "../index.css";
 
 export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
   title: "Casa Pronto Imobiliare",
   description: "Apartamente, case, terenuri de vanzare in Alba Iulia",
 };
