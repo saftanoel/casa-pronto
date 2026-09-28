@@ -357,7 +357,6 @@ const PropertyListingsInteractiveInner = ({ tip: routeTip, zone: routeZone, init
 
   const searchParams = useSearchParams();
   const router = useRouter();
-  const navigate = router.push;
   // Guard: don't fire the sync-params navigate() on the very first render.
   // Without this, the two competing useEffects (lines 406 + 418) race each other
   // on mount and cause tip !== routeTip → immediate redirect to /proprietati.
@@ -453,11 +452,11 @@ const PropertyListingsInteractiveInner = ({ tip: routeTip, zone: routeZone, init
       if (activeTab && activeTab !== "toate") params.set("tab", activeTab);
       if (zone) params.set("zone", zone);
       if (newCat) params.set("tip", newCat);
-      navigate(`/proprietati?${params.toString()}`, { replace: true });
+      router.replace(`/proprietati?${params.toString()}`);
     } else {
       setTip(newCat);
     }
-  }, [routeTip, activeTab, zone, navigate]);
+  }, [routeTip, activeTab, zone, router]);
 
   const handleSetZone = useCallback((newZone: string) => {
     if (routeZone && newZone !== routeZone) {
@@ -465,11 +464,11 @@ const PropertyListingsInteractiveInner = ({ tip: routeTip, zone: routeZone, init
       if (activeTab && activeTab !== "toate") params.set("tab", activeTab);
       if (tip) params.set("tip", tip);
       if (newZone) params.set("zone", newZone);
-      navigate(`/proprietati?${params.toString()}`, { replace: true });
+      router.replace(`/proprietati?${params.toString()}`);
     } else {
       setZone(newZone);
     }
-  }, [routeZone, activeTab, tip, navigate]);
+  }, [routeZone, activeTab, tip, router]);
 
   const currentSearch = useMemo(() => {
     const params = new URLSearchParams();
