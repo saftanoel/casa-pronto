@@ -38,3 +38,7 @@ dist-ssr
 *.zip
 public/prerender-properties.json
 public/prerender-taxonomies.json
+
+# Notes and internal documentation
+INTERVIEW_NOTES_CASA_PRONTO.md
+CODE_DEEP_DIVE.md
