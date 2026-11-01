@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchAllProperties, fetchPropertyById, fetchInitialProperties, fetchTaxonomies } from "@/lib/api/wordpress";
 import type { Property } from "@/data/properties";
 import type { TaxonomyResponse } from "@/lib/api/wordpress";
+import { SSG_PROPERTY_SEED_QUERY_KEY } from "@/ssg-hydration";
 
 /** Fetch initial 60 properties (instant first paint) */
 export function useInitialProperties(limit = 60) {
@@ -24,7 +25,19 @@ export function useAllProperties(enabled = true) {
     gcTime: 60 * 60 * 1000,
     refetchOnWindowFocus: false,
     refetchOnMount: false,
+    retry: false,
     enabled,
+  });
+}
+
+/** Route-specific data embedded in SSG HTML; it never initiates a request. */
+export function usePrerenderedProperties() {
+  return useQuery<Property[]>({
+    queryKey: SSG_PROPERTY_SEED_QUERY_KEY,
+    queryFn: () => Promise.resolve([]),
+    enabled: false,
+    staleTime: Infinity,
+    gcTime: 60 * 60 * 1000,
   });
 }
 

@@ -5,7 +5,7 @@ import CookieConsent from "react-cookie-consent";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 
 import Header from "@/components/Header";
 import Hero from "@/components/Hero";
@@ -18,26 +18,38 @@ import PropertiesPage from "./pages/PropertiesPage";
 import PropertyDetailPage from "./pages/PropertyDetailPage";
 import NotFound from "./pages/NotFound";
 import { SearchProvider } from "@/context/SearchContext";
-import { useProperties, useAllProperties } from "@/hooks/useProperties";
-
-const queryClient = new QueryClient();
+import { useProperties, useAllProperties, usePrerenderedProperties } from "@/hooks/useProperties";
+import { capturePrerenderQueryState, queryClient, savePrerenderPropertySeed } from "@/ssg-hydration";
+import { PROPERTY_LISTING_ROUTES } from "@/data/propertyListingRoutes";
 
 
 const Index = () => {
   const location = useLocation();
-  const { data: initialProperties = [], isLoading } = useProperties();
-  const { data: allPropertiesFull } = useAllProperties();
-  const properties = allPropertiesFull ?? initialProperties;
+  const {
+    data: initialProperties = [],
+    isLoading,
+    isSuccess: isInitialSuccess,
+    isFetching: isInitialFetching,
+  } = useProperties();
+  const {
+    data: allPropertiesFull,
+    isSuccess: isAllSuccess,
+    isFetching: isAllFetching,
+  } = useAllProperties();
+  const { data: prerenderedProperties } = usePrerenderedProperties();
+  const currentRoute = window.location.pathname.replace(/\/+$/, "") || "/";
+  const hydratedRoute = window.__PRERENDER_HYDRATION__?.route.replace(/\/+$/, "") || "";
+  const isHydratedSsgRoute = currentRoute === hydratedRoute && window.location.search === "";
+  const properties = allPropertiesFull ?? (isHydratedSsgRoute ? prerenderedProperties : undefined) ?? initialProperties;
 
   useEffect(() => {
-    if (!isLoading) {
-      const timer = setTimeout(() => {
-        (window as any).__PRERENDER_READY_FIRED = true;
-        document.dispatchEvent(new Event('prerender-ready'));
-      }, 1000);
-      return () => clearTimeout(timer);
+    if (isInitialSuccess && !isInitialFetching && isAllSuccess && !isAllFetching) {
+      savePrerenderPropertySeed(allPropertiesFull ?? []);
+      capturePrerenderQueryState();
+      window.__PRERENDER_READY_FIRED = true;
+      document.dispatchEvent(new Event('prerender-ready'));
     }
-  }, [isLoading]);
+  }, [isInitialSuccess, isInitialFetching, isAllSuccess, isAllFetching, allPropertiesFull]);
 
   useEffect(() => {
     if (location.hash) {
@@ -96,50 +108,13 @@ const App = () => (
           </CookieConsent>
           <Routes>
             <Route path="/" element={<Index />} />
-            {/* --- 1. CATEGORII PRINCIPALE (Top 8 din baza ta) --- */}
-            <Route path="/apartamente" element={<PropertiesPage tip="apartamente" />} />
-            <Route path="/case" element={<PropertiesPage tip="case" />} />
-            <Route path="/terenuri" element={<PropertiesPage tip="terenuri" />} />
-            <Route path="/spatii-comerciale" element={<PropertiesPage tip="spatii-comerciale" />} />
-            <Route path="/garsoniere" element={<PropertiesPage tip="garsoniere" />} />
-            <Route path="/hale" element={<PropertiesPage tip="hale" />} />
-            <Route path="/birouri" element={<PropertiesPage tip="birouri" />} />
-            <Route path="/vile" element={<PropertiesPage tip="vile" />} />
-
-            {/* --- 2. APARTAMENTE & GARSONIERE PE ZONE (Top zone Alba Iulia) --- */}
-            <Route path="/apartamente-cetate" element={<PropertiesPage tip="apartamente" zone="cetate" />} />
-            <Route path="/apartamente-centru" element={<PropertiesPage tip="apartamente" zone="centru" />} />
-            <Route path="/apartamente-ampoi" element={<PropertiesPage tip="apartamente" zone="ampoi" />} />
-            <Route path="/apartamente-alba-micesti" element={<PropertiesPage tip="apartamente" zone="alba-micesti" />} />
-            <Route path="/garsoniere-cetate" element={<PropertiesPage tip="garsoniere" zone="cetate" />} />
-            <Route path="/garsoniere-centru" element={<PropertiesPage tip="garsoniere" zone="centru" />} />
-
-            {/* --- 3. CASE PE ZONE --- */}
-            <Route path="/case-cetate" element={<PropertiesPage tip="case" zone="cetate" />} />
-            <Route path="/case-centru" element={<PropertiesPage tip="case" zone="centru" />} />
-            <Route path="/case-alba-micesti" element={<PropertiesPage tip="case" zone="alba-micesti" />} />
-            <Route path="/case-micesti" element={<PropertiesPage tip="case" zone="micesti" />} />
-            <Route path="/case-ciugud" element={<PropertiesPage tip="case" zone="ciugud" />} />
-            <Route path="/case-barabant" element={<PropertiesPage tip="case" zone="barabant" />} />
-            <Route path="/case-oarda" element={<PropertiesPage tip="case" zone="oarda" />} />
-            <Route path="/case-cugir" element={<PropertiesPage tip="case" zone="cugir" />} />
-
-            {/* --- 4. TERENURI PE ZONE --- */}
-            <Route path="/terenuri-cetate" element={<PropertiesPage tip="terenuri" zone="cetate" />} />
-            <Route path="/terenuri-centru" element={<PropertiesPage tip="terenuri" zone="centru" />} />
-            <Route path="/terenuri-alba-micesti" element={<PropertiesPage tip="terenuri" zone="alba-micesti" />} />
-            <Route path="/terenuri-micesti" element={<PropertiesPage tip="terenuri" zone="micesti" />} />
-            <Route path="/terenuri-ciugud" element={<PropertiesPage tip="terenuri" zone="ciugud" />} />
-            <Route path="/terenuri-oarda" element={<PropertiesPage tip="terenuri" zone="oarda" />} />
-
-            {/* --- 5. SPAȚII COMERCIALE & HALE --- */}
-            <Route path="/spatii-comerciale-cetate" element={<PropertiesPage tip="spatii-comerciale" zone="cetate" />} />
-            <Route path="/spatii-comerciale-centru" element={<PropertiesPage tip="spatii-comerciale" zone="centru" />} />
-            <Route path="/hale-cetate" element={<PropertiesPage tip="hale" zone="cetate" />} />
-            <Route path="/hale-centru" element={<PropertiesPage tip="hale" zone="centru" />} />
-
-            {/* Rute Standard / Fallback */}
-            <Route path="/proprietati" element={<PropertiesPage />} />
+            {PROPERTY_LISTING_ROUTES.map((route) => (
+              <Route
+                key={route.path}
+                path={route.path}
+                element={<PropertiesPage tip={route.tip} zone={route.zone} />}
+              />
+            ))}
             <Route path="/proprietate/:id" element={<PropertyDetailPage />} />
             <Route path="*" element={<NotFound />} />
           </Routes>

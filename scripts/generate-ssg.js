@@ -4,12 +4,14 @@ import puppeteer from 'puppeteer';
 import express from 'express';
 import { fileURLToPath } from 'url';
 import Critters from 'critters';
+import { addPrerenderHydration } from './ssg-hydration-html.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 8080;
 const DIST_DIR = path.resolve(__dirname, '../dist');
+const SHELL_SNAPSHOT_PATH = path.resolve(__dirname, '../.ssg-vite-shell.html');
 
 const routes = [
   "/",
@@ -48,15 +50,39 @@ const routes = [
   "/terenuri-oarda"
 ];
 
-async function startServer() {
+const hydrationErrorsByRoute = new Map();
+const blockedProductionApiRequests = [];
+const blockedExternalRequestsByType = new Map();
+
+function recordHydrationError(route, message) {
+  if (!/Minified React error #(418|423)|Hydration failed|error while hydrating/i.test(message)) {
+    return;
+  }
+  if (!hydrationErrorsByRoute.has(route)) hydrationErrorsByRoute.set(route, new Set());
+  hydrationErrorsByRoute.get(route).add(message);
+}
+
+function isProductionApiRequest(requestUrl) {
+  try {
+    const parsed = new URL(requestUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    const isCasaProntoHost = hostname === 'casapronto.ro' || hostname.endsWith('.casapronto.ro');
+    return isCasaProntoHost && parsed.pathname.startsWith('/wp-json/');
+  } catch {
+    return false;
+  }
+}
+
+async function startServer(spaShellHtml) {
   const app = express();
 
-  // Serve static files from dist
+  // Serve built assets, fixtures, and route HTML already generated.
   app.use(express.static(DIST_DIR));
 
-  // For any other route, serve index.html (SPA fallback)
+  // Unknown routes always receive the original in-memory Vite shell.
+  // Never read dist/index.html here: the root route overwrites it first.
   app.use((req, res) => {
-    res.sendFile(path.join(DIST_DIR, 'index.html'));
+    res.status(200).type('html').set('Cache-Control', 'no-store').send(spaShellHtml);
   });
 
   return new Promise((resolve) => {
@@ -88,24 +114,63 @@ async function processBatch(batchRoutes, batchIndex) {
 
       let page;
       let timedOut = false;
+      let routeFailure = null;
       try {
         page = await browser.newPage();
 
-        // Pass browser console to Node terminal
-        page.on('console', msg => console.log(`[Browser Console] ${msg.type().toUpperCase()} ${msg.text()}`));
-        page.on('pageerror', err => console.error(`[Browser Error] ${err.toString()}`));
-        page.on('requestfailed', request => console.error(`[Browser Request Failed] ${request.url()} - ${request.failure()?.errorText}`));
+        // Keep browser diagnostics attributable to the current route.
+        page.on('console', msg => {
+          const message = msg.text();
+          console.log(`[Browser Console ${route}] ${msg.type().toUpperCase()} ${message}`);
+          recordHydrationError(route, message);
+        });
+        page.on('pageerror', err => {
+          const message = err.toString();
+          console.error(`[Browser Error ${route}] ${message}`);
+          recordHydrationError(route, message);
+        });
+        page.on('requestfailed', request => console.error(
+          `[Browser Request Failed ${route}] ${request.url()} - ${request.failure()?.errorText}`
+        ));
 
-        // Aggressive Network Interception
+        // Intercept all browser requests before navigation, including fetch/XHR.
+        // Only the local SSG server and data URLs may continue.
         await page.setRequestInterception(true);
         page.on('request', request => {
           const reqUrl = request.url();
-          if (reqUrl.startsWith(`http://localhost:${PORT}`) || reqUrl.startsWith('data:')) {
-            request.continue();
-          } else {
-            // Block ALL external requests
-            request.abort();
+          let requestOrigin = null;
+          try {
+            requestOrigin = new URL(reqUrl).origin;
+          } catch {
+            // Malformed and non-HTTP requests remain blocked.
           }
+          if (requestOrigin === `http://localhost:${PORT}` || reqUrl.startsWith('data:')) {
+            request.continue().catch(error => {
+              console.error(`[SSG] Failed to continue local request ${reqUrl}: ${error.message}`);
+            });
+            return;
+          }
+
+          const resourceType = request.resourceType();
+          blockedExternalRequestsByType.set(
+            resourceType,
+            (blockedExternalRequestsByType.get(resourceType) || 0) + 1
+          );
+
+          if (isProductionApiRequest(reqUrl)) {
+            const record = {
+              route,
+              method: request.method(),
+              resourceType,
+              url: reqUrl,
+            };
+            blockedProductionApiRequests.push(record);
+            console.warn(`[SSG] Blocked production API request before network: ${JSON.stringify(record)}`);
+          }
+
+          request.abort().catch(error => {
+            console.error(`[SSG] Failed to abort external request ${reqUrl}: ${error.message}`);
+          });
         });
 
         // Strict 20s Global Timeout for the entire route
@@ -114,26 +179,31 @@ async function processBatch(batchRoutes, batchIndex) {
             // domcontentloaded is enough — all JS is bundled synchronously (no lazy chunks)
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
-            // Wait until #root has actual content — guards against React not finishing render
+            // Wait for route components to confirm their required local queries succeeded,
+            // then allow the committed DOM two paint frames to settle.
             await page.waitForFunction(
               () => {
                 const root = document.getElementById('root');
-                return root && root.children.length > 0 && root.innerText.trim().length > 50;
+                return window.__PRERENDER_READY_FIRED === true
+                  && root
+                  && root.children.length > 0
+                  && root.querySelector('h1')
+                  && root.innerText.trim().length > 50;
               },
-              { timeout: 8000, polling: 200 }
-            ).catch(() => {
-              console.warn('[SSG] #root did not populate fully — snapshotting anyway');
-            });
+              { timeout: 15000, polling: 100 }
+            );
 
-            // Small buffer for animations / final React commit
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await page.evaluate(() => new Promise(resolve => {
+              requestAnimationFrame(() => requestAnimationFrame(resolve));
+            }));
           })(),
           new Promise((_, reject) => setTimeout(() => reject(new Error("Global Route Timeout (20s)")), 20000))
         ]);
 
       } catch (err) {
         timedOut = true;
-        console.warn(`[SSG] Skipping route ${route} due to timeout. No HTML saved. Error: ${err.message}`);
+        routeFailure = err;
+        console.error(`[SSG] Route ${route} failed readiness or navigation; generation will stop. Error: ${err.message}`);
       }
 
       if (!timedOut) {
@@ -141,11 +211,14 @@ async function processBatch(batchRoutes, batchIndex) {
         try {
           if (page && !page.isClosed()) {
             // Use Promise.race for evaluate as well to absolutely prevent 180s protocol deadlocks
-            const html = await Promise.race([
-              page.evaluate(() => document.documentElement.outerHTML),
+            const rendered = await Promise.race([
+              page.evaluate(() => ({
+                html: document.documentElement.outerHTML,
+                queryState: window.__PRERENDER_QUERY_STATE__ || null,
+              })),
               new Promise((_, reject) => setTimeout(() => reject(new Error("HTML Extraction Timeout (5s)")), 5000))
             ]);
-            const fullHtml = `<!DOCTYPE html>\n${html}`;
+            const fullHtml = `<!DOCTYPE html>\n${addPrerenderHydration(rendered.html, route, rendered.queryState)}`;
 
             let routeDir = DIST_DIR;
             if (route !== '/') {
@@ -158,7 +231,8 @@ async function processBatch(batchRoutes, batchIndex) {
           }
         } catch (e) {
           console.error(`[SSG] Failed to save HTML for ${route}: ${e.message}`);
-          timedOut = true; // Mark as poisoned so we restart the browser
+          timedOut = true;
+          routeFailure = e;
         }
       }
 
@@ -191,6 +265,10 @@ async function processBatch(batchRoutes, batchIndex) {
           ]
         });
       }
+
+      if (routeFailure) {
+        throw new Error(`[SSG] Aborting after route ${route} failed: ${routeFailure.message}`);
+      }
     }
   } finally {
     console.log(`[SSG] Closing browser for Batch ${batchIndex}...`);
@@ -219,7 +297,28 @@ async function runSSG() {
     process.exit(1);
   }
 
-  const server = await startServer();
+  const shellPath = path.join(DIST_DIR, 'index.html');
+  if (!fs.existsSync(shellPath)) {
+    throw new Error('[SSG] Vite SPA shell is missing. Run the isolated Vite build first.');
+  }
+
+  const currentIndexHtml = fs.readFileSync(shellPath, 'utf-8');
+  let spaShellHtml;
+  if (currentIndexHtml.includes('<div id="root"></div>')) {
+    // Save the shell outside dist so later SSG retries can still use it.
+    spaShellHtml = currentIndexHtml;
+    fs.writeFileSync(SHELL_SNAPSHOT_PATH, spaShellHtml, 'utf-8');
+  } else if (fs.existsSync(SHELL_SNAPSHOT_PATH)) {
+    spaShellHtml = fs.readFileSync(SHELL_SNAPSHOT_PATH, 'utf-8');
+    if (!spaShellHtml.includes('<div id="root"></div>')) {
+      throw new Error('[SSG] Saved Vite SPA shell is invalid. Run the isolated Vite build again.');
+    }
+    console.log('[SSG] Reusing the saved original Vite shell for this validation run.');
+  } else {
+    throw new Error('[SSG] Expected a fresh Vite SPA shell with an empty #root. Rebuild dist before SSG.');
+  }
+
+  const server = await startServer(spaShellHtml);
   const BATCH_SIZE = 10;
 
   try {
@@ -234,43 +333,27 @@ async function runSSG() {
       await processBatch(chunks[j], j + 1);
     }
 
-    console.log('\n[SSG] Successfully prerendered all routes!');
+    const missingRoutes = routes.filter(route => {
+      const routeDir = route === '/' ? DIST_DIR : path.join(DIST_DIR, route);
+      return !fs.existsSync(path.join(routeDir, 'index.html'));
+    });
+    if (missingRoutes.length > 0) {
+      throw new Error(`[SSG] Missing generated route HTML: ${missingRoutes.join(', ')}`);
+    }
+    console.log(`[SSG] Generated HTML for all ${routes.length} configured routes.`);
 
     // --- WORDPRESS THEME GENERATION ---
     console.log('[SSG] Generating WordPress Theme files (index.php & style.css)...');
 
     let styleCss = `/*
-Theme Name: Casa Pronto Imobiliare (React SPA)
+Theme Name: Casa Pronto Imobiliare (React SPA) 2
 Theme URI: https://casapronto.ro
 Author: Safta Noel
 Description: Tema custom ultra-rapida bazata pe React pentru agentia Casa Pronto Alba Iulia. Static Site Generated(SSG) cu Puppeteer & Vite.
-Version: 8.3.14
+Version: 8.4
 License: Proprietary
 Text Domain: casapronto
 */`;
-
-    // --- AUTO-INCREMENT VERSION ---
-    try {
-      const scriptPath = __filename;
-      let scriptContent = fs.readFileSync(scriptPath, 'utf-8');
-      const versionRegex = new RegExp("\\nVersion: (\\d+)\\.(\\d+)\\.(\\d+)\\n");
-      const versionMatch = scriptContent.match(versionRegex);
-      
-      if (versionMatch) {
-        const major = parseInt(versionMatch[1], 10);
-        const minor = parseInt(versionMatch[2], 10);
-        const patch = parseInt(versionMatch[3], 10) + 1;
-        const newVersion = `${major}.${minor}.${patch}`;
-        
-        scriptContent = scriptContent.replace(versionRegex, `\nVersion: ${newVersion}\n`);
-        fs.writeFileSync(scriptPath, scriptContent, 'utf-8');
-        
-        styleCss = styleCss.replace(versionRegex, `\nVersion: ${newVersion}\n`);
-        console.log(`[SSG] Auto-bumped Theme Version to ${newVersion}`);
-      }
-    } catch (err) {
-      console.warn('[SSG] Failed to auto-bump version:', err.message);
-    }
 
     const indexPhp = `<?php
 /**
@@ -492,7 +575,28 @@ add_filter('redirect_canonical', function($redirect_url, $requested_url) {
       }
     }
     console.log(`[SSG] Critical CSS inlined into ${htmlFiles.length} HTML files.`);
-    console.log('[SSG] The dist/ folder is ready to be zipped!');
+    const blockedByType = [...blockedExternalRequestsByType.entries()]
+      .map(([type, count]) => type + '=' + count)
+      .join(', ');
+    console.log('[SSG] External browser requests blocked before network by resource type: ' + (blockedByType || 'none'));
+    console.log('[SSG] Production WordPress API requests blocked before network: ' + blockedProductionApiRequests.length);
+    for (const record of blockedProductionApiRequests) {
+      console.log('[SSG] Blocked API record: ' + JSON.stringify(record));
+    }
+
+    if (hydrationErrorsByRoute.size > 0) {
+      console.error('[SSG] React hydration errors were observed:');
+      for (const [route, messages] of hydrationErrorsByRoute.entries()) {
+        for (const message of messages) {
+          console.error('[SSG] Hydration error route=' + route + ': ' + message);
+        }
+      }
+      console.error('[SSG] Candidate output is not release-ready until these errors are investigated.');
+      process.exitCode = 1;
+    } else {
+      console.log('[SSG] No React hydration errors #418 or #423 were observed.');
+      console.log('[SSG] The dist/ folder is ready for review.');
+    }
     // -----------------------------------
 
   } catch (error) {

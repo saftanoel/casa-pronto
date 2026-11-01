@@ -12,10 +12,11 @@ import { type Property } from "@/data/properties";
 import Header from "@/components/Header";
 import Footer from "@/components/Footer";
 import { SearchProvider } from "@/context/SearchContext";
-import { useInitialProperties, useAllProperties, useTaxonomies } from "@/hooks/useProperties";
+import { useInitialProperties, useAllProperties, usePrerenderedProperties, useTaxonomies } from "@/hooks/useProperties";
 import { PropertyGridSkeletons, PropertyRowSkeletons } from "@/components/PropertyCardSkeleton";
-import { matchesTaxonomy } from "@/hooks/useTaxonomyOptions";
+import { matchesPropertyRouteFilters } from "@/data/propertyListingRoutes";
 import { useDebounce } from "@/hooks/useDebounce";
+import { capturePrerenderQueryState, savePrerenderPropertySeed } from "@/ssg-hydration";
 
 type FilterTab = "toate" | "cumparare" | "inchiriere" | "vandute";
 type ViewMode = "grid" | "list";
@@ -269,9 +270,34 @@ const ITEMS_PER_PAGE = 12;
 
 // Am adăugat parametrul din rută (routeTip)
 const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone?: string }) => {
-  const { data: initialProperties = [], isLoading: isLoadingInitial } = useInitialProperties(60);
-  const { data: taxonomyData } = useTaxonomies();
-  const { data: allPropertiesFull, isFetched: isAllFetched } = useAllProperties(true);
+  const {
+    data: initialProperties = [],
+    isLoading: isLoadingInitial,
+    isSuccess: isInitialSuccess,
+    isFetching: isInitialFetching,
+  } = useInitialProperties(60);
+  const {
+    data: taxonomyData,
+    isSuccess: isTaxonomySuccess,
+    isFetching: isTaxonomyFetching,
+  } = useTaxonomies();
+  const {
+    data: allPropertiesFull,
+    isFetched: isAllFetched,
+    isError: isAllError,
+    isSuccess: isAllSuccess,
+    isFetching: isAllFetching,
+    refetch: retryAllProperties,
+  } = useAllProperties(true);
+  const { data: prerenderedProperties } = usePrerenderedProperties();
+
+  const currentRoute = typeof window === "undefined"
+    ? ""
+    : (window.location.pathname.replace(/\/+$/, "") || "/");
+  const hydratedRoute = typeof window === "undefined"
+    ? ""
+    : (window.__PRERENDER_HYDRATION__?.route.replace(/\/+$/, "") || "/");
+  const isHydratedSsgRoute = currentRoute === hydratedRoute && window.location.search === "";
 
   const hasFullData = isAllFetched && !!allPropertiesFull;
   const allProperties = hasFullData ? allPropertiesFull : initialProperties;
@@ -288,27 +314,28 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
     }
   }, [allPropertiesFull]);
 
-  // Semnal pentru Vite Prerender (SSG) - Declansat cand sunt gata datele
+  // SSG readiness is emitted only after all route-required local queries succeed.
   useEffect(() => {
-    if (initialProperties.length > 0 || isAllFetched) {
-      const timer = setTimeout(() => {
-        (window as any).__PRERENDER_READY_FIRED = true;
-        document.dispatchEvent(new Event('prerender-ready'));
-      }, 1000); // mic delay ca să se randeze și pozele în DOM
-      return () => clearTimeout(timer);
+    if (
+      isInitialSuccess && !isInitialFetching &&
+      isTaxonomySuccess && !isTaxonomyFetching &&
+      isAllSuccess && !isAllFetching &&
+      !!allPropertiesFull
+    ) {
+      savePrerenderPropertySeed(allPropertiesFull);
+      capturePrerenderQueryState();
+      window.__PRERENDER_READY_FIRED = true;
+      document.dispatchEvent(new Event('prerender-ready'));
     }
-  }, [initialProperties, isAllFetched]);
-
-  // Absolute 5s Fallback pentru subcategorii cu 0 rezultate (Evită timeout-ul Puppeteer)
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (!(window as any).__PRERENDER_READY_FIRED) {
-        (window as any).__PRERENDER_READY_FIRED = true;
-        document.dispatchEvent(new Event('prerender-ready'));
-      }
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, []);
+  }, [
+    isInitialSuccess,
+    isInitialFetching,
+    isTaxonomySuccess,
+    isTaxonomyFetching,
+    isAllSuccess,
+    isAllFetching,
+    allPropertiesFull,
+  ]);
 
   const zones = useMemo(() => {
     const rawZones = taxonomyData?.property_city || [];
@@ -413,7 +440,7 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
   const hasTaxonomyFilter = !!(zone || tip || activeTab !== "toate");
   const hasActiveFilter = !!(zone || tip || rooms || area || price || debouncedSearch || activeTab !== "toate");
 
-  const isWaitingForFullData = hasActiveFilter && !hasFullData && !isLoadingInitial;
+  const isWaitingForFullData = hasActiveFilter && !hasFullData && !isLoadingInitial && !isAllError && !isHydratedSsgRoute;
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -508,7 +535,7 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
   ];
 
   const filteredProperties = useMemo(() => {
-    const sourceData = allPropertiesFull ?? initialProperties;
+    const sourceData = allPropertiesFull ?? (isHydratedSsgRoute ? prerenderedProperties : undefined) ?? initialProperties;
 
     const normalizeText = (text: string | number | null | undefined) => {
       if (!text) return "";
@@ -530,8 +557,7 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
 
     const result = sourceData.filter((p) => {
       if (!matchTab(p, activeTab)) return false;
-      if (zone && !matchesTaxonomy(p, "property_city", zone)) return false;
-      if (tip && !matchesTaxonomy(p, "property_type", tip)) return false;
+      if (!matchesPropertyRouteFilters(p, { tip, zone })) return false;
 
       if (rooms) {
         if (rooms === "4+") {
@@ -602,7 +628,7 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
     }
 
     return result;
-  }, [activeTab, zone, tip, rooms, area, price, debouncedSearch, sortBy, allPropertiesFull, initialProperties]);
+  }, [activeTab, zone, tip, rooms, area, price, debouncedSearch, sortBy, allPropertiesFull, prerenderedProperties, initialProperties, isHydratedSsgRoute]);
 
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 18;
@@ -891,7 +917,7 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
                     <>
                       <span>{filteredProperties.length} proprietăți</span>
 
-                      {!hasFullData && (
+                      {!hasFullData && !isAllError && (
                         <span className="text-primary font-medium text-xs md:text-sm animate-pulse">
                           (se încarcă mai multe...)
                         </span>
@@ -902,6 +928,23 @@ const PropertiesPage = ({ tip: routeTip, zone: routeZone }: { tip?: string; zone
                   )}
                   {isPending && <span className="ml-2 text-primary text-xs md:text-sm">Se actualizează...</span>}
                 </p>
+
+                {isAllError && !hasFullData && (
+                  <div role="alert" className="mb-6 rounded-xl border border-destructive/40 bg-destructive/5 p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <p className="text-sm text-foreground">
+                      Nu am putut încărca toate ofertele. Proprietățile deja afișate rămân disponibile.
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="flex-shrink-0"
+                      onClick={() => { void retryAllProperties(); }}
+                      disabled={isAllFetching}
+                    >
+                      {isAllFetching ? "Se reîncearcă..." : "Reîncearcă încărcarea"}
+                    </Button>
+                  </div>
+                )}
 
                 {/* Eager User Loading Overlay */}
                 {isWaitingForFullData && (
