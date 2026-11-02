@@ -1,4 +1,5 @@
 import { type Property } from "@/data/properties";
+import { selectPrerenderPropertyCandidates } from "@/lib/ssgPropertySelection";
 
 export const WP_API_BASE = import.meta.env.VITE_API_BASE_URL || "https://casapronto.ro/wp-json/casapronto/v1";
 
@@ -10,11 +11,13 @@ if (!WP_API_BASE) {
 }
 // Custom endpoint returns flattened data — no _embed or _fields needed
 const PER_PAGE_LIST = 12;
+const PER_PAGE_ALL = 200;
+const MAX_PER_PAGE = 200;
 
-function isPrerendering(): boolean {
+export function isPrerendering(): boolean {
   if (typeof window === 'undefined') return false;
   const isPuppeteer = window.navigator && window.navigator.userAgent && window.navigator.userAgent.includes('HeadlessChrome');
-  const isInject = (window as any).__PRERENDER_INJECTED?.isPrerendering;
+  const isInject = window.__PRERENDER_INJECTED?.isPrerendering;
   return !!(isPuppeteer || isInject);
 }
 
@@ -72,6 +75,99 @@ export interface PaginatedResult {
   properties: Property[];
   totalPages: number;
   totalItems: number;
+}
+
+interface PaginatedPosts {
+  posts: WPPost[];
+  totalPages: number;
+  totalItems: number;
+}
+
+function readPaginationHeader(response: Response, name: "X-WP-Total" | "X-WP-TotalPages"): number {
+  const rawValue = response.headers.get(name);
+  if (rawValue === null || !/^\d+$/.test(rawValue.trim())) {
+    throw new Error(
+      `Missing or malformed ${name} pagination header. The API must return this header and expose it to the frontend with Access-Control-Expose-Headers.`
+    );
+  }
+
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`Malformed ${name} pagination header: expected a safe integer.`);
+  }
+  return value;
+}
+
+function validatePosts(value: unknown, page: number): WPPost[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Page ${page} returned an invalid response: expected an array of properties.`);
+  }
+
+  for (const [index, post] of value.entries()) {
+    if (
+      !post ||
+      typeof post !== "object" ||
+      !Number.isSafeInteger((post as WPPost).id) ||
+      (post as WPPost).id <= 0 ||
+      typeof (post as WPPost).date !== "string" ||
+      typeof (post as WPPost).title?.rendered !== "string" ||
+      typeof (post as WPPost).content?.rendered !== "string"
+    ) {
+      throw new Error(`Page ${page} returned an invalid property at position ${index + 1}.`);
+    }
+  }
+
+  return value as WPPost[];
+}
+
+async function fetchPaginatedPosts(
+  page: number,
+  perPage: number,
+  expectedTotals?: { totalPages: number; totalItems: number }
+): Promise<PaginatedPosts> {
+  const response = await fetch(`${WP_API_BASE}/anunturi?per_page=${perPage}&page=${page}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch properties page ${page}: HTTP ${response.status}.`);
+  }
+
+  const totalPages = readPaginationHeader(response, "X-WP-TotalPages");
+  const totalItems = readPaginationHeader(response, "X-WP-Total");
+  const calculatedTotalPages = Math.ceil(totalItems / perPage);
+  if (totalPages !== calculatedTotalPages) {
+    throw new Error(
+      `Invalid pagination headers on page ${page}: X-WP-TotalPages is ${totalPages}, but ${totalItems} properties at ${perPage} per page requires ${calculatedTotalPages} pages.`
+    );
+  }
+
+  if (expectedTotals && (totalPages !== expectedTotals.totalPages || totalItems !== expectedTotals.totalItems)) {
+    throw new Error(`Pagination totals changed while loading page ${page}; the catalog may have changed during the request.`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`Page ${page} returned invalid JSON.`);
+  }
+
+  const posts = validatePosts(payload, page);
+  const expectedCount = Math.max(0, Math.min(perPage, totalItems - (page - 1) * perPage));
+  if (posts.length !== expectedCount) {
+    throw new Error(
+      `Page ${page} returned ${posts.length} properties; expected ${expectedCount} from the pagination totals. The catalog may be incomplete.`
+    );
+  }
+
+  return { posts, totalPages, totalItems };
+}
+
+function assertUniquePostIds(posts: WPPost[], seenIds: Set<number>, page: number): void {
+  for (const post of posts) {
+    if (seenIds.has(post.id)) {
+      throw new Error(`Property ${post.id} appeared more than once while loading page ${page}.`);
+    }
+    seenIds.add(post.id);
+  }
 }
 
 function stripHtml(html: string): string {
@@ -239,16 +335,14 @@ export function mapWPPostToProperty(post: WPPost, preferSmallImage = false): Pro
 
 /** Paginated fetch — used for load more */
 export async function fetchPropertiesPaginated(page = 1, perPage = PER_PAGE_LIST): Promise<PaginatedResult> {
-  const url = `${WP_API_BASE}/anunturi?per_page=${perPage}&page=${page}`;
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch properties: ${response.status}`);
+  if (!Number.isSafeInteger(page) || page < 1) {
+    throw new Error("Page must be a positive integer.");
   }
-
-  const totalPages = parseInt(response.headers.get("X-WP-TotalPages") || "1");
-  const totalItems = parseInt(response.headers.get("X-WP-Total") || "0");
-  const posts: WPPost[] = await response.json();
+  if (!Number.isSafeInteger(perPage) || perPage < 1) {
+    throw new Error("Page size must be a positive integer.");
+  }
+  const safePerPage = Math.min(perPage, MAX_PER_PAGE);
+  const { posts, totalPages, totalItems } = await fetchPaginatedPosts(page, safePerPage);
 
   return {
     properties: posts.map(p => mapWPPostToProperty(p, true)),
@@ -263,31 +357,11 @@ export async function fetchAllProperties(): Promise<Property[]> {
     try {
       const res = await fetch('/prerender-properties.json');
       if (res.ok) {
-        const posts: WPPost[] = await res.json();
+        const posts = validatePosts(await res.json(), 1);
 
-        // Memory Optimization for Prerender:
-        // Instead of processing 4700+ properties for EVERY page, we limit the array
-        // to a smaller chunk (e.g., 100 items) to prevent Chromium OOM crashes.
-        // To ensure subcategories (like /case-oarda) aren't empty, we filter first.
         const pathname = typeof window !== 'undefined' ? window.location.pathname.toLowerCase() : '';
-        let filteredPosts = posts;
-
-        if (pathname !== '/' && pathname !== '/proprietati' && pathname.length > 1) {
-          const searchTerms = pathname.substring(1).replace('-', ' ').split(' ');
-          const matchingPosts = posts.filter(p => {
-            const rawStr = [
-              p.title?.rendered,
-              p.content?.rendered,
-              JSON.stringify(p.taxonomies)
-            ].join(" ").toLowerCase();
-            return searchTerms.some(term => rawStr.includes(term));
-          });
-
-          // Combine matches first, then pad with other posts, and slice
-          filteredPosts = Array.from(new Set([...matchingPosts, ...posts])).slice(0, 100);
-        } else {
-          filteredPosts = posts.slice(0, 100);
-        }
+        // Apply the configured route's exact taxonomy filters before limiting the SSG payload.
+        const filteredPosts = selectPrerenderPropertyCandidates(posts, pathname, 100);
 
         return filteredPosts.map(p => mapWPPostToProperty(p, true));
       }
@@ -298,35 +372,20 @@ export async function fetchAllProperties(): Promise<Property[]> {
     return [];
   }
 
-  const PER_PAGE = 10;
-  const firstUrl = `${WP_API_BASE}/anunturi?per_page=${PER_PAGE}&page=1`;
-  const firstResponse = await fetch(firstUrl);
+  const firstPage = await fetchPaginatedPosts(1, PER_PAGE_ALL);
+  const allPosts = [...firstPage.posts];
+  const seenIds = new Set<number>();
+  assertUniquePostIds(firstPage.posts, seenIds, 1);
 
-  if (!firstResponse.ok) {
-    throw new Error(`Failed to fetch properties: ${firstResponse.status}`);
+  // Request each following page only after the prior response was validated.
+  for (let page = 2; page <= firstPage.totalPages; page += 1) {
+    const nextPage = await fetchPaginatedPosts(page, PER_PAGE_ALL, firstPage);
+    assertUniquePostIds(nextPage.posts, seenIds, page);
+    allPosts.push(...nextPage.posts);
   }
 
-  const totalPages = parseInt(firstResponse.headers.get("X-WP-TotalPages") || "1");
-  const firstBatch: WPPost[] = await firstResponse.json();
-  let allPosts = [...firstBatch];
-
-  if (totalPages > 1) {
-    // Mobile optimization (only 1 page is loading in the background to prevent timeouts)
-    const chunkSize = 1;
-
-    for (let i = 2; i <= totalPages; i += chunkSize) {
-      const chunkPromises = [];
-      for (let j = i; j < i + chunkSize && j <= totalPages; j++) {
-        chunkPromises.push(
-          fetch(`${WP_API_BASE}/anunturi?per_page=${PER_PAGE}&page=${j}`)
-            .then(r => r.json() as Promise<WPPost[]>)
-        );
-      }
-      const chunkResults = await Promise.all(chunkPromises);
-      for (const batch of chunkResults) {
-        allPosts = allPosts.concat(batch);
-      }
-    }
+  if (allPosts.length !== firstPage.totalItems) {
+    throw new Error(`Loaded ${allPosts.length} properties, but pagination headers reported ${firstPage.totalItems}. The catalog is incomplete.`);
   }
 
   return allPosts.map(p => mapWPPostToProperty(p, true));
@@ -380,25 +439,9 @@ export async function fetchInitialProperties(limit = 9): Promise<Property[]> {
     try {
       const res = await fetch('/prerender-properties.json');
       if (res.ok) {
-        const posts: WPPost[] = await res.json();
-        // Memory Optimization & SEO Relevance for Prerender
+        const posts = validatePosts(await res.json(), 1);
         const pathname = typeof window !== 'undefined' ? window.location.pathname.toLowerCase() : '';
-        let filteredPosts = posts;
-
-        if (pathname !== '/' && pathname !== '/proprietati' && pathname.length > 1) {
-          const searchTerms = pathname.substring(1).replace('-', ' ').split(' ');
-          const matchingPosts = posts.filter(p => {
-            const rawStr = [
-              p.title?.rendered,
-              p.content?.rendered,
-              JSON.stringify(p.taxonomies)
-            ].join(" ").toLowerCase();
-            return searchTerms.some(term => rawStr.includes(term));
-          });
-          filteredPosts = Array.from(new Set([...matchingPosts, ...posts])).slice(0, limit);
-        } else {
-          filteredPosts = posts.slice(0, limit);
-        }
+        const filteredPosts = selectPrerenderPropertyCandidates(posts, pathname, limit);
 
         return filteredPosts.map(p => mapWPPostToProperty(p, true));
       }
@@ -414,7 +457,13 @@ export async function fetchInitialProperties(limit = 9): Promise<Property[]> {
   if (!response.ok) {
     throw new Error(`Failed to fetch initial properties: ${response.status}`);
   }
-  const posts: WPPost[] = await response.json();
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("Failed to fetch initial properties: invalid JSON.");
+  }
+  const posts = validatePosts(payload, 1);
   return posts.map(p => mapWPPostToProperty(p, true));
 }
 
